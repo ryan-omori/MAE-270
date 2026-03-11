@@ -1,0 +1,524 @@
+"""
+Hull MDO Pipeline — Flat Deck + Simple Keel Profile
+=====================================================
+PROFILE VIEW (side, y=0 plane):
+  Deck line : P1(0,0,F) ──────────────────── P5(L,0,F)   flat, FIXED
+  Keel line : P1 → P2 → P3 → P4 → P5                    Bézier, optimised
+
+  P1 = (0,   0, F)    bow  top         FIXED
+  P2 = (0,   0, h1)   bow  entry       h1: z only (how deep bow sits at WL)
+  P3 = (h2,  0, -T)   keel forward     h2: x only (where keel starts)
+  P4 = (h3,  0, -T)   keel aft         h3: x only (where keel ends)
+  P5 = (L,   0, F)    stern top        FIXED
+
+KEEL PLAN (bottom, z=-T):
+  B1 → B2 → B3 → B4                   Bézier keel width planform
+
+FRONT VIEW (bow-on cross-section, y-z plane at x=0):
+  FK = (0,  0,      -h16*T)   keel depth at bow      h16
+  FW = (0, +h17*B,  0    )   hull half-width at WL   h17  (mirrored to port)
+  Cross-section Bezier: (-FW) -> FK -> (+FW)  i.e. port-keel-stbd
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.lines import Line2D
+from scipy.special import comb
+import csdl_alpha as csdl
+import modopt as opt
+
+
+# ============================================================
+# 0)  CONSTANTS
+# ============================================================
+
+CONST = dict(
+    L = 1.00,
+    B = 0.375,
+    T = 0.25,
+    F = 0.30,
+)
+
+# ============================================================
+# 0b) PARAMETER BOUNDS
+# ============================================================
+
+H_BOUNDS = np.array([
+    [0.00,  0.20],   # h1 : P2 z   bow entry height
+    [0.05,  0.30],   # h2 : P3 x   keel fwd
+    [0.70,  0.95],   # h3 : P4 x   keel aft
+    [0.10,  0.35],   # h4 : D2 x
+    [0.60,  1.00],   # h5 : D2 y
+    [0.40,  0.60],   # h6 : D3 x
+    [0.60,  1.00],   # h7 : D3 y
+    [0.65,  0.90],   # h8 : D4 x
+    [0.60,  1.00],   # h9 : D4 y
+    [0.05,  0.25],   # h10: B1 x
+    [0.15,  0.40],   # h11: B2 x
+    [0.00,  0.30],   # h12: B2 y
+    [0.60,  0.85],   # h13: B3 x
+    [0.00,  0.30],   # h14: B3 y
+    [0.75,  0.95],   # h15: B4 x
+    [0.30,  1.00],   # h16: FK z   bow keel depth (fraction of T; 1.0=full draft)
+    [0.40,  1.00],   # h17: FW y   bow hull half-width at WL (fraction of B)
+    *([[0.0, 1.0]] * 12),  # unused h18..h29
+])
+
+
+def unnorm(h):
+    lo, hi = H_BOUNDS[:, 0], H_BOUNDS[:, 1]
+    return lo + h * (hi - lo)
+
+
+# ============================================================
+# 1)  CONTROL POINT BUILDER
+# ============================================================
+
+def build_control_points(h, L=1.0, B=0.375, T=0.25, F=0.30):
+    h  = np.clip(np.asarray(h, dtype=float), 0.0, 1.0)
+    hp = unnorm(h)
+
+    P1 = np.array([0.0,    0.0,   F     ])
+    P2 = np.array([0.0,    0.0,   hp[0] ])
+    P3 = np.array([hp[1],  0.0,  -T     ])
+    P4 = np.array([hp[2],  0.0,  -T     ])
+    P5 = np.array([L,      0.0,   F     ])
+
+    D1 = np.array([0.0,    B,          F])
+    D2 = np.array([hp[3],  hp[4] * B,  F])
+    D3 = np.array([hp[5],  hp[6] * B,  F])
+    D4 = np.array([hp[7],  hp[8] * B,  F])
+
+    B1 = np.array([hp[9],   0.0,         -T])
+    B2 = np.array([hp[10],  hp[11] * B,  -T])
+    B3 = np.array([hp[12],  hp[13] * B,  -T])
+    B4 = np.array([hp[14],  0.0,         -T])
+
+    # ── Front-view cross-section control points (y-z plane, x=0) ─────────────
+    FK = np.array([0.0,   0.0,          -hp[15] * T])  # bow keel depth   h16
+    FW = np.array([0.0,   hp[16] * B,    0.0       ])  # bow hull width    h17
+
+    return dict(P1=P1, P2=P2, P3=P3, P4=P4, P5=P5,
+                D1=D1, D2=D2, D3=D3, D4=D4,
+                B1=B1, B2=B2, B3=B3, B4=B4,
+                FK=FK, FW=FW)
+
+
+def cp_to_vector(cp):
+    order = ["P1","P2","P3","P4","P5",
+             "D1","D2","D3","D4",
+             "B1","B2","B3","B4",
+             "FK","FW"]
+    return np.concatenate([cp[k] for k in order])  # 15 pts * 3 = 45 values
+
+
+# ============================================================
+# 2)  BÉZIER CURVES
+# ============================================================
+
+def bezier(pts, n=200):
+    pts = np.asarray(pts, dtype=float)
+    deg = len(pts) - 1
+    t   = np.linspace(0, 1, n)
+    C   = np.zeros((n, 3))
+    for k, p in enumerate(pts):
+        b = comb(deg, k, exact=True) * t**k * (1 - t)**(deg - k)
+        C += np.outer(b, p)
+    return C
+
+
+def hull_curves(cp, n=250):
+    L = cp["P5"][0]
+    F = cp["P1"][2]
+    return dict(
+        deck_line = np.array([[0.0, 0.0, F], [L, 0.0, F]]),
+        keel_line = bezier([cp["P1"], cp["P2"], cp["P3"],
+                             cp["P4"], cp["P5"]], n),
+        deck_edge = bezier([cp["D1"], cp["D2"], cp["D3"], cp["D4"]], n),
+        keel_plan  = bezier([cp["B1"], cp["B2"], cp["B3"], cp["B4"]], n),
+        # Front cross-section: port-WL -> FW_port -> FK -> FW_stbd -> stbd-WL
+        # FW is mirrored to port side for the Bezier
+        front_xsec = bezier([
+            np.array([0.0, -cp["FW"][1], 0.0]),   # port  WL edge
+            np.array([0.0, -cp["FW"][1], cp["FK"][2]]),  # port  lower
+            cp["FK"],                               # centreline keel
+            np.array([0.0,  cp["FW"][1], cp["FK"][2]]),  # stbd  lower
+            np.array([0.0,  cp["FW"][1], 0.0]),    # stbd  WL edge
+        ], n),
+    )
+
+
+# ============================================================
+# 3)  PHYSICS
+# ============================================================
+
+def _sort_interp(curve, xs, col):
+    idx = np.argsort(curve[:, 0])
+    return np.interp(xs, curve[idx, 0], curve[idx, col])
+
+
+def compute_R_and_V(h, L=1.0, B=0.375, T=0.25, F=0.30,
+                    U=2.0, rho=1000.0, nu=1e-6, g=9.81):
+    cp = build_control_points(h, L, B, T, F)
+    cv = hull_curves(cp, n=300)
+
+    xs    = np.linspace(0.02 * L, 0.98 * L, 80)
+    y_hw  = _sort_interp(cv["deck_edge"], xs, col=1)
+    z_k   = _sort_interp(cv["keel_line"], xs, col=2)
+    draft = np.maximum(-z_k, 0.0)
+
+    sec_area = 0.5 * np.pi * y_hw * draft
+    V = float(np.trapz(2.0 * sec_area, xs))
+
+    perim = np.pi * np.sqrt(0.5 * (y_hw**2 + draft**2))
+    S     = float(np.trapz(2.0 * perim, xs))
+
+    Re  = max(U * L / nu, 1e4)
+    Cf  = 0.075 / (np.log10(Re) - 2.0)**2
+    k   = 0.10 + 0.20 * float(np.mean(y_hw)) / B
+    R_f = 0.5 * rho * U**2 * S * Cf * (1.0 + k)
+
+    Fn  = U / np.sqrt(g * L)
+    phi = (float(np.mean(y_hw)) / B) * (float(np.mean(draft)) / T)
+    R_w = 0.5 * rho * U**2 * S * 0.55 * Fn**4 * phi
+
+    return float(R_f + R_w), float(V)
+
+
+# ============================================================
+# 4)  DATASET
+# ============================================================
+
+def sample_halton(n, d=29, seed=0):
+    try:
+        from scipy.stats import qmc
+        return qmc.Halton(d=d, scramble=True, seed=seed).random(n)
+    except Exception:
+        rng = np.random.default_rng(seed)
+        return rng.random((n, d))
+
+
+def generate_dataset(n_samples=600, seed=1):
+    print(f"  Sampling {n_samples} designs...")
+    H  = sample_halton(n_samples, d=29, seed=seed)
+    R  = np.zeros(n_samples)
+    V  = np.zeros(n_samples)
+    CP = np.zeros((n_samples, 45))   # 15 control points * 3 coords
+
+    for i in range(n_samples):
+        R[i], V[i] = compute_R_and_V(H[i], **CONST)
+        CP[i]      = cp_to_vector(build_control_points(H[i], **CONST))
+
+    return H, R, V, CP
+
+
+# ============================================================
+# 5)  SURROGATE
+# ============================================================
+
+def _std(X):
+    mu  = X.mean(0)
+    sig = X.std(0);  sig[sig < 1e-12] = 1.0
+    return (X - mu) / sig, mu, sig
+
+def _phi(Z):
+    return np.hstack([np.ones((len(Z), 1)), Z, Z**2])
+
+def fit_surrogate(X, Y, lam=1e-6):
+    if Y.ndim == 1:
+        Y = Y.reshape(-1, 1)
+    Z, mu_x, sig_x = _std(X)
+    Phi = _phi(Z)
+    mu_y  = Y.mean(0);  sig_y = Y.std(0);  sig_y[sig_y < 1e-12] = 1.0
+    Ys    = (Y - mu_y) / sig_y
+    W = np.linalg.solve(Phi.T @ Phi + lam * np.eye(Phi.shape[1]), Phi.T @ Ys)
+    return dict(mu_x=mu_x, sig_x=sig_x, mu_y=mu_y, sig_y=sig_y, W=W)
+
+def predict_numpy(x, model):
+    single = (x.ndim == 1)
+    if single:
+        x = x.reshape(1, -1)
+    z   = (x - model["mu_x"]) / model["sig_x"]
+    phi = _phi(z)
+    y   = (phi @ model["W"]) * model["sig_y"] + model["mu_y"]
+    return y[0] if single else y
+
+def predict_csdl(h_var, model):
+    z      = (h_var - model["mu_x"]) / model["sig_x"]
+    n_in   = len(model["mu_x"])
+    n_feat = 1 + 2 * n_in
+    n_out  = model["W"].shape[1]
+    ones  = csdl.Variable(value=np.ones(1))
+    feat  = csdl.concatenate([ones, z, z * z])
+    W_var = csdl.Variable(value=model["W"])
+    ys    = csdl.matmat(csdl.reshape(feat, (1, n_feat)), W_var)
+    y     = csdl.reshape(ys, (n_out,)) * model["sig_y"] + model["mu_y"]
+    return y
+
+
+# ============================================================
+# 6)  CSDL OPTIMIZATION PROBLEM
+# ============================================================
+
+def build_problem(cp_surr, R_surr, V_surr, V_ref, gamma=0.02, h0=None):
+    if h0 is None:
+        h0 = 0.5 * np.ones(29)
+
+    rec = csdl.Recorder(inline=True)
+    rec.start()
+
+    h = csdl.Variable(value=h0.copy(), name="h")
+    h.set_as_design_variable(lower=np.zeros(29), upper=np.ones(29))
+
+    cp_hat = predict_csdl(h,      cp_surr)
+    R_hat  = predict_csdl(cp_hat, R_surr)
+    V_hat  = predict_csdl(cp_hat, V_surr)
+
+    R_hat.set_as_objective()
+    ((1.0 - gamma) * V_ref - V_hat).set_as_constraint(upper=0.0)
+    (V_hat - (1.0 + gamma) * V_ref).set_as_constraint(upper=0.0)
+
+    rec.stop()
+    sim  = csdl.experimental.PySimulator(rec)
+    prob = opt.CSDLAlphaProblem(problem_name="HullOpt", simulator=sim)
+    prob.x0 = h0.copy()
+    return prob, sim
+
+
+# ============================================================
+# 7)  CROSS-SECTION HELPERS
+# ============================================================
+
+def cross_section_bezier(cv, n=200):
+    """
+    Returns (y_pts, z_pts) for the bow cross-section Bezier curve.
+    This uses the FK and FW control points directly.
+    """
+    curve = cv["front_xsec"]   # (n, 3) — x is always 0, use y and z
+    return curve[:, 1], curve[:, 2]
+
+
+def cross_section_ellipse(x_station, cv, n=200):
+    """
+    Fallback: half-ellipse cross-section at an arbitrary x-station,
+    scaled to match beam and draft at that station.
+    Used for mid and aft station overlays in the front view plot.
+    """
+    half_beam = float(_sort_interp(cv["deck_edge"], np.array([x_station]), col=1))
+    z_keel    = float(_sort_interp(cv["keel_line"], np.array([x_station]), col=2))
+    draft     = max(-z_keel, 0.0)
+    y = np.linspace(-half_beam, half_beam, n)
+    if half_beam > 1e-9 and draft > 1e-9:
+        z = -draft * np.sqrt(np.maximum(1.0 - (y / half_beam)**2, 0.0))
+    else:
+        z = np.zeros_like(y)
+    return y, z
+
+
+# ============================================================
+# 8)  VISUALIZATION
+# ============================================================
+
+def plot_hull(h_init, h_opt, cp_surr, R_surr, V_surr):
+    cp_i = build_control_points(h_init, **CONST)
+    cp_o = build_control_points(h_opt,  **CONST)
+    cv_i = hull_curves(cp_i)
+    cv_o = hull_curves(cp_o)
+
+    cpv_i = predict_numpy(h_init, cp_surr)
+    cpv_o = predict_numpy(h_opt,  cp_surr)
+    Rs_i  = float(predict_numpy(cpv_i, R_surr))
+    Rs_o  = float(predict_numpy(cpv_o, R_surr))
+    Vs_i  = float(predict_numpy(cpv_i, V_surr))
+    Vs_o  = float(predict_numpy(cpv_o, V_surr))
+    Rt_i, Vt_i = compute_R_and_V(h_init, **CONST)
+    Rt_o, Vt_o = compute_R_and_V(h_opt,  **CONST)
+
+    BLUE   = "steelblue"
+    ORANGE = "darkorange"
+    L, B, T, F = CONST["L"], CONST["B"], CONST["T"], CONST["F"]
+
+    fig = plt.figure(figsize=(16, 11))
+    fig.suptitle("Hull MDO — Flat Deck + Bezier Keel Profile",
+                 fontsize=14, fontweight="bold")
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.34)
+
+    # ── (A) Side / Profile view ───────────────────────────────────────────────
+    ax = fig.add_subplot(gs[0, :])
+
+    for cv, cp, color, Rt, Vt, Rs, Vs in [
+        (cv_i, cp_i, BLUE,   Rt_i, Vt_i, Rs_i, Vs_i),
+        (cv_o, cp_o, ORANGE, Rt_o, Vt_o, Rs_o, Vs_o),
+    ]:
+        tag = "Initial" if color == BLUE else "Optimal"
+        lbl = (f"{tag}   R={Rt:.3f} N (surr={Rs:.3f} N)   "
+               f"V={Vt:.4f} m3 (surr={Vs:.4f} m3)")
+
+        keel = cv["keel_line"]
+        deck = cv["deck_line"]
+
+        ax.plot(deck[:, 0], deck[:, 2], color=color, lw=2.5, ls="-", label=lbl)
+        ax.plot(keel[:, 0], keel[:, 2], color=color, lw=2.5, ls="-")
+        ax.plot([0.0, 0.0], [F, cp["P2"][2]], color=color, lw=1.2, ls=":")
+        ax.plot([L,   L  ], [F, F           ], color=color, lw=1.2, ls=":")
+
+        xq  = np.linspace(0, L, 300)
+        zd  = np.full_like(xq, F)
+        idx = np.argsort(keel[:, 0])
+        zk  = np.interp(xq, keel[idx, 0], keel[idx, 2])
+        ax.fill_between(xq, zd, zk, alpha=0.15, color=color)
+
+        for name in ["P1", "P2", "P3", "P4", "P5"]:
+            pt = cp[name]
+            ax.scatter(pt[0], pt[2], s=70, color=color,
+                       zorder=7, edgecolors="white", linewidths=0.8)
+            ax.annotate(name, (pt[0], pt[2]),
+                        textcoords="offset points", xytext=(6, 4),
+                        fontsize=8, color=color, fontweight="bold")
+
+    ax.axhline(0, color="navy", lw=1.0, ls=":", label="Waterline")
+    ax.set_xlabel("x  -  Length (m)", fontsize=11)
+    ax.set_ylabel("z  -  Height (m)", fontsize=11)
+    ax.set_title("(A) Side / Profile View   "
+                 "[deck = flat at z=F,  keel = Bezier P1->P2->P3->P4->P5]",
+                 fontsize=10)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.set_xlim(-0.04, L + 0.04)
+    ax.grid(True, alpha=0.25)
+
+    # ── (B) Front / Bow-on cross-section view ─────────────────────────────────
+    ax2 = fig.add_subplot(gs[1, 0])
+
+    for cv, cp, color in [(cv_i, cp_i, BLUE), (cv_o, cp_o, ORANGE)]:
+        # Bow station: use the explicit Bezier with FK and FW control points
+        y_bow, z_bow = cross_section_bezier(cv)
+        ax2.plot(y_bow, z_bow, color=color, lw=2.2, ls="-")
+        hb_bow = float(_sort_interp(cv["deck_edge"], np.array([0.05 * L]), col=1))
+        ax2.plot([-hb_bow, hb_bow], [0, 0], color=color, lw=1.0, alpha=0.6)
+        ax2.fill_between(y_bow, z_bow, 0, alpha=0.12, color=color)
+
+        # Mid and aft stations: ellipse approximation (dashed/dotted)
+        for x_st, ls in [(0.50 * L, "--"), (0.90 * L, ":")]:
+            y_cs, z_cs = cross_section_ellipse(x_st, cv)
+            ax2.plot(y_cs, z_cs, color=color, lw=1.5, ls=ls, alpha=0.75)
+            hb = float(_sort_interp(cv["deck_edge"], np.array([x_st]), col=1))
+            ax2.plot([-hb, hb], [0, 0], color=color, lw=0.8, ls=ls, alpha=0.4)
+
+        # Plot FK (keel depth) and FW (hull width) control points
+        FK = cp["FK"]
+        FW = cp["FW"]
+        # FK: single point on centreline
+        ax2.scatter(FK[1], FK[2], s=90, color=color, marker="^",
+                    zorder=8, edgecolors="white", linewidths=0.8)
+        ax2.annotate("FK", (FK[1], FK[2]),
+                     textcoords="offset points", xytext=(5, -10),
+                     fontsize=8, color=color, fontweight="bold")
+        # FW: mirrored port and starboard
+        for sign, side in [(+1, "FW"), (-1, "FW")]:
+            ax2.scatter(sign * FW[1], FW[2], s=90, color=color, marker="s",
+                        zorder=8, edgecolors="white", linewidths=0.8)
+        ax2.annotate("FW", (FW[1], FW[2]),
+                     textcoords="offset points", xytext=(5, 4),
+                     fontsize=8, color=color, fontweight="bold")
+        ax2.annotate("FW", (-FW[1], FW[2]),
+                     textcoords="offset points", xytext=(-28, 4),
+                     fontsize=8, color=color, fontweight="bold")
+
+    ax2.axhline(0, color="navy", lw=0.9, ls=":", zorder=2, label="Waterline")
+    ax2.axvline(0, color="gray", lw=0.6, ls="--", alpha=0.4)
+
+    ax2.set_xlabel("y  -  Half-beam (m)", fontsize=10)
+    ax2.set_ylabel("z  -  Height (m)",    fontsize=10)
+    ax2.set_title("(B) Front / Bow-On Cross-Section View\n[solid=bow Bezier w/ FK+FW,  dashed=mid,  dotted=aft]",
+                  fontsize=10)
+    ax2.set_aspect("equal")
+    ax2.grid(True, alpha=0.25)
+    ax2.legend(handles=[
+        Line2D([], [], color=BLUE,   lw=2,   label="Initial"),
+        Line2D([], [], color=ORANGE, lw=2,   label="Optimal"),
+        Line2D([], [], color="k",    lw=2.0, ls="-",  label="Bow  (Bezier)"),
+        Line2D([], [], color="k",    lw=1.5, ls="--", label="Mid  (ellipse)"),
+        Line2D([], [], color="k",    lw=1.5, ls=":",  label="Aft  (ellipse)"),
+        Line2D([], [], color="k",    lw=0, marker="^", markersize=7,
+               label="FK  keel depth"),
+        Line2D([], [], color="k",    lw=0, marker="s", markersize=7,
+               label="FW  hull width"),
+    ], fontsize=7, loc="lower center", ncol=2)
+
+    # ── (C) Keel / Bottom view ────────────────────────────────────────────────
+    ax3 = fig.add_subplot(gs[1, 1])
+
+    for cv, cp, color in [(cv_i, cp_i, BLUE), (cv_o, cp_o, ORANGE)]:
+        k = cv["keel_plan"]
+        ax3.plot(k[:, 0],  k[:, 1], color=color, lw=2)
+        ax3.plot(k[:, 0], -k[:, 1], color=color, lw=2)
+        ax3.fill_between(k[:, 0], -k[:, 1], k[:, 1], alpha=0.12, color=color)
+        for name in ["B1", "B2", "B3", "B4"]:
+            pt = cp[name]
+            ax3.scatter(pt[0],  pt[1], s=45, color=color, zorder=6,
+                        edgecolors="white", linewidths=0.6)
+            ax3.scatter(pt[0], -pt[1], s=45, color=color, zorder=6,
+                        edgecolors="white", linewidths=0.6)
+            ax3.annotate(name, (pt[0], pt[1]),
+                         textcoords="offset points", xytext=(4, 3),
+                         fontsize=7, color=color, fontweight="bold")
+
+    ax3.set_xlabel("x  -  Length (m)", fontsize=10)
+    ax3.set_ylabel("y  -  Half-beam (m)", fontsize=10)
+    ax3.set_title("(C) Keel / Bottom View  (z = -T)", fontsize=10)
+    ax3.set_aspect("equal")
+    ax3.grid(True, alpha=0.25)
+    ax3.legend(handles=[
+        Line2D([], [], color=BLUE,   lw=2, label="Initial"),
+        Line2D([], [], color=ORANGE, lw=2, label="Optimal"),
+    ], fontsize=8)
+
+    plt.savefig("hull_flat_deck_keel.png", dpi=150, bbox_inches="tight")
+    print("Saved -> hull_flat_deck_keel.png")
+    plt.show()
+
+
+# ============================================================
+# 9)  MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("Generating dataset...")
+    H, R, V, CP = generate_dataset(n_samples=600, seed=1)
+    print(f"  R in [{R.min():.3f}, {R.max():.3f}] N")
+    print(f"  V in [{V.min():.4f}, {V.max():.4f}] m3")
+
+    print("\nTraining surrogates...")
+    cp_surr = fit_surrogate(H,  CP, lam=1e-6)
+    R_surr  = fit_surrogate(CP, R,  lam=1e-6)
+    V_surr  = fit_surrogate(CP, V,  lam=1e-6)
+
+    CP_pred = predict_numpy(H, cp_surr)
+    R_pred  = predict_numpy(CP_pred, R_surr).flatten()
+    V_pred  = predict_numpy(CP_pred, V_surr).flatten()
+    rmse    = lambda a, b: float(np.sqrt(np.mean((a - b)**2)))
+    print(f"  Train RMSE  R: {rmse(R, R_pred):.4f} N   V: {rmse(V, V_pred):.5f} m3")
+
+    h0    = 0.5 * np.ones(29)
+    _, V_ref = compute_R_and_V(h0, **CONST)
+    gamma = 0.02
+    print(f"\n  V_ref = {V_ref:.5f} m3   gamma={gamma}  "
+          f"band [{(1-gamma)*V_ref:.5f}, {(1+gamma)*V_ref:.5f}]")
+
+    print("\nRunning SQP optimizer...")
+    prob, sim = build_problem(cp_surr, R_surr, V_surr,
+                               V_ref, gamma=gamma, h0=h0.copy())
+    solver = opt.SQP(prob, maxiter=300, opt_tol=1e-8, recording=True)
+    solver.solve()
+    h_opt = solver.results["x"]
+
+    Ri, Vi = compute_R_and_V(h0,    **CONST)
+    Ro, Vo = compute_R_and_V(h_opt, **CONST)
+    print(f"\nResults (truth model):")
+    print(f"  R initial = {Ri:.4f} N")
+    print(f"  R optimal = {Ro:.4f} N   ({100*(Ri-Ro)/Ri:.1f}% reduction)")
+    print(f"  V optimal = {Vo:.5f} m3  (band: +/-{gamma*100:.0f}% of {V_ref:.5f})")
+
+    plot_hull(h0, h_opt, cp_surr, R_surr, V_surr)
